@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+USAGE="
+Recursively import an existing maildir into mox mail server.
+
+Usage: ${0} [OPTIONS] <mox_account> <target_mailbox> <maildir>
+
+  ${0} -f -p mox_user /var/mail/user_maildir Archive/imported_mail
+
+Options:
+  -f, --fatal
+      Consider all non-zero Mox exit codes as fatal.
+
+  -c, --confirm
+      Prompt for user confirmation before executing import action.
+
+  -p, --pause
+      Prompt for user confirmation after import summary.
+
+  -l, --legacy
+      Force legacy Maildir imports (Maildirs will NOT be modified in place to
+      standardize expected sub-directories for Mox import). This may lead to
+      Mox import failures on older Maildir setups.
+
+Maildir:
+  A directory containing any of the following sub-directories: cur, new, or tmp
+  will be considered a Maildir.
+
+  Once identified, legacy Maildirs (including Dovecot) are MODIFIED in place to
+  create any of these missing directories to enable successful Mox importing.
+  Disable this using --legacy.
+
+  The total mail count in these directories are used to confirm the import into
+  mox is successful. In some cases, these numbers may not line up requiring
+  manual validation of that specific Maildir import.
+
+  Maildirs must be located where Mox can read data (typically
+  /var/opt/mox/data).
+
+Mox:
+  All standard mox command considerations apply, which include placing the
+  Maildir in a location that is readable by Mox (typically /var/opt/mox/data).
+
+  Mox should exist on the user path and this script should be executed from the
+  Mox installation root directory.
+
+  Mox will automatically create target mailbox for the given user if it does
+  not exist, and the Maildir will be imported recursively under this mailbox.
+
+Errors:
+  Spam and Junk filtering likely needs to be DISABLED for the account import to
+  be successful. This is expressed as an import failure with the message:
+
+    importing...
+    import, expected ok, got 'open junk filter: looking up ham/spam message count: absent'
+
+  Disable via the Mox account settings panel.
+
+Source: https://github.com/r-pufky/import_maildir_mox
+"
+
+if [ "${#}" -lt 3 ]; then
+  echo "${USAGE}"
+  exit 1
+fi
+
+FATAL=0
+CONFIRM=0
+PAUSE=0
+LEGACY=0
+POSITIONAL_ARGS=()
+
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    --fatal|-f)
+      FATAL=1
+      shift
+      ;;
+    --confirm|-c)
+      CONFIRM=1
+      shift
+      ;;
+    --pause|-p)
+      PAUSE=1
+      shift
+      ;;
+    --legacy|-l)
+      LEGACY=1
+      shift
+      ;;
+    -*)
+      echo "${USAGE}"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("${1}")
+      shift
+      ;;
+  esac
+done
+
+if [ "${#POSITIONAL_ARGS[@]}" -lt 3 ]; then
+  echo "${USAGE}"
+  exit 1
+fi
+
+MOX_USER="${POSITIONAL_ARGS[0]}"
+MOX_TARGET="${POSITIONAL_ARGS[1]}"
+MAILDIR_ROOT="${POSITIONAL_ARGS[2]}"
+
+if [ ! -d "${MAILDIR_ROOT}" ]; then
+  echo "Error: Source directory '${MAILDIR_ROOT}' does not exist." >&2
+  exit 1
+else
+  MAILDIR_ROOT=$(cd "${MAILDIR_ROOT}" && pwd)  # Normalize.
+fi
+
+echo "Source Maildir:     ${MAILDIR_ROOT}"
+echo "Target Account:     ${MOX_USER}"
+echo "Target Import Root: ${MOX_TARGET}"
+if [ ${PAUSE} -eq 1 ]; then
+  read -n 1 -s -r -p "Press enter to continue (ctrl+c to exit)" </dev/tty || true
+  echo
+fi
+
+find "${MAILDIR_ROOT}" -type d \( -name "cur" -o -name "new" -o -name "tmp" \) \
+  | xargs -I {} dirname {} \
+  | sort -u | while read -r maildir; do
+
+  rel_path="${maildir#"${MAILDIR_ROOT}"}"
+  rel_path="${rel_path#/}"  # Remove leading /.
+
+  # Convert maildir path (.{mail}.{sub}.{sub}) ➔ {mail}/{sub}/{sub}.
+  target_rel_path=""
+  if [ -n "${rel_path}" ]; then
+    IFS='/' read -ra parts <<< "${rel_path}"
+    for part in "${parts[@]}"; do
+      clean_part="${part#.}"  # Remove leading .
+      clean_part="${clean_part//./\/}"  # . ➔ /
+      if [ -n "${clean_part}" ]; then
+        if [ -z "${target_rel_path}" ]; then
+          target_rel_path="${clean_part}"
+        else
+          target_rel_path="${target_rel_path}/${clean_part}"
+        fi
+      fi
+    done
+  fi
+
+  if [ -z "${target_rel_path}" ]; then
+    target_mailbox="${MOX_TARGET}"
+  else
+    target_mailbox="${MOX_TARGET}/${target_rel_path}"
+  fi
+
+  if [ ${LEGACY} -eq 0 ]; then
+    mkdir -p "${maildir}/cur" "${maildir}/new" "${maildir}/tmp"
+  fi
+  maildir_size=$(du -shc "${maildir}" 2>/dev/null | tail -n 1 | awk '{print $1}')
+
+  maildir_email_count=0
+  for sub in cur new tmp; do
+    sub_path="${maildir}/${sub}"
+    if [ -d "${sub_path}" ]; then
+      count=$(find "${sub_path}" -mindepth 1 -maxdepth 1 ! -name '.*' | wc -l)
+      maildir_email_count=$((maildir_email_count + count))
+    fi
+  done
+
+  echo "----------------------------------------"
+  echo "Maildir:  ${maildir}"
+  echo "Target:   ${target_mailbox}"
+  echo "Messages: ${maildir_email_count} (~${maildir_size:-unknown})"
+  if [ ${CONFIRM} -eq 1 ]; then
+    read -n 1 -s -r -p "Press enter to continue (ctrl+c to exit)" </dev/tty || true
+    echo
+  fi
+
+  set +e  # Capture any exit status from any subshell.
+  import_output=$(mox import maildir "${MOX_USER}" "${target_mailbox}" "${maildir}" 2>&1)
+  import_status=$?
+  set -e
+
+  if [ ${import_status} -ne 0 ]; then
+    echo "[ERROR]: mox import failed for ${maildir}" >&2
+    echo "➔ ${import_output}"
+    if [ ${FATAL} -eq 1 ]; then
+      exit 2
+    else
+      continue
+    fi
+  fi
+
+  imported_count=$(echo "${import_output}" | grep -oE '[0-9]+' | tail -n 1)
+
+  if [ -n "${imported_count}" ] && [ "${imported_count}" -eq "${maildir_email_count}" ]; then
+    echo "[SUCCESS]: ${imported_count} messages successfully imported."
+  else
+    echo "[WARNING]: Count verification inconclusive or mismatch."
+    echo "➔ Expected: ${maildir_email_count}"
+    echo "➔ Reported/Parsed: ${imported_count:-unknown}"
+    echo "➔ ${import_output}"
+  fi
+done
+
+echo
+echo "Import complete."
